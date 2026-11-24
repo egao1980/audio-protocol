@@ -126,33 +126,221 @@ envelope, no SoundFont. See engine.lisp."))
 
 (defun smf-duration (smf)
   "Exact seconds from the start of SMF to its latest tick."
-  (declare (ignorable smf))
-  (%au0-pending 'smf-duration))
+  (check-type smf stack-midi:smf)
+  (stack-midi:ticks-to-seconds
+   (reduce #'max (stack-midi:smf-tracks smf)
+           :key (lambda (track) (reduce #'+ track :key #'stack-midi:midi-event-delta))
+           :initial-value 0)
+   (stack-midi:smf-division smf)
+   (stack-midi:tempo-map smf)))
 
 (defun render-frames (smf sample-rate &optional (tail 1))
   "Frames of every render of SMF at SAMPLE-RATE with TAIL seconds after its end."
-  (declare (ignorable smf sample-rate tail))
-  (%au0-pending 'render-frames))
+  (check-type tail (real 0))
+  (seconds-to-frame (+ (smf-duration smf) tail) sample-rate))
+
+(defun %designated-smf (smf)
+  "SMF itself, or the SMF STACK-MIDI:READ-SMF reads from it: its conditions and
+restarts reach the caller, and a non-designator is its TYPE-ERROR."
+  (if (stack-midi:smf-p smf) smf (stack-midi:read-smf smf)))
+
+(defun %check-render-limit (smf tail)
+  "When SMF's duration plus TAIL exceeds *MAX-RENDER-SECONDS* (not NIL), signal
+AUDIO-LIMIT-EXCEEDED inside a CONTINUE restart, which renders anyway."
+  (let ((limit *max-render-seconds*)
+        (seconds (+ (smf-duration smf) tail)))
+    (when (and limit (> seconds limit))
+      (restart-case (error 'audio-limit-exceeded
+                           :limit limit :value seconds
+                           :reason "a render longer than *MAX-RENDER-SECONDS*")
+        (continue ()
+          :report "Render anyway."
+          nil)))))
+
+(defun %render-shape-p (buffer smf sample-rate channels tail)
+  "Is BUFFER a PCM-BUFFER of SAMPLE-RATE, CHANNELS and (render-frames smf
+sample-rate tail) frames?"
+  (and (pcm-buffer-p buffer)
+       (= sample-rate (pcm-buffer-sample-rate buffer))
+       (= channels (pcm-buffer-channels buffer))
+       (= (render-frames smf sample-rate tail) (pcm-buffer-frames buffer))))
+
+(defun %note-p (event)
+  "Does EVENT start a note: a NOTE-ON-EVENT with velocity > 0?"
+  (and (stack-midi:note-on-event-p event)
+       (plusp (stack-midi:note-on-event-velocity event))))
+
+(defun %filtered-smf (smf keep-p)
+  "SMF with every track, every non-channel event, and the channel events for
+which (funcall KEEP-P track-index event) is true, each track rebuilt from
+absolute times, so times, the tempo map and the duration don't move."
+  (stack-midi:make-smf
+   :format (stack-midi:smf-format smf)
+   :division (stack-midi:smf-division smf)
+   :tracks (loop for track in (stack-midi:smf-tracks smf)
+                 for i from 0
+                 collect (let ((index i))
+                           (stack-midi:track-from-absolute
+                            (remove-if (lambda (timed)
+                                         (let ((event (cdr timed)))
+                                           (and (stack-midi:channel-event-p event)
+                                                (not (funcall keep-p index event)))))
+                                       (stack-midi:track-to-absolute track)))))))
+
+(defun %track-name (track index)
+  "The text of TRACK's first TRACK-NAME-EVENT, else \"Track INDEX\"."
+  (let ((event (find-if #'stack-midi:track-name-event-p track)))
+    (if event
+        (stack-midi:text-meta-event-text event)
+        (format nil "Track ~D" index))))
+
+(defun %reference-notes (smf sample-rate)
+  "The notes of SMF as fresh (n0 n1 key velocity) lists in note-on order: frames
+n0 <= n < n1 sound KEY at VELOCITY. Events go in MERGE-TRACKS order; a note
+ends at the first later note-off (or note-on of velocity 0) of its channel and
+key that doesn't end an earlier note, else at the end of the SMF."
+  (let ((division (stack-midi:smf-division smf))
+        (tempo-map (stack-midi:tempo-map smf))
+        (stop (seconds-to-frame (smf-duration smf) sample-rate))
+        (open (make-array (* 16 128) :initial-element '())) ; queue per channel and key
+        (notes '()))
+    (flet ((frame (tick)
+             (seconds-to-frame (stack-midi:ticks-to-seconds tick division tempo-map)
+                               sample-rate))
+           (voice (event key)
+             (+ (* 128 (stack-midi:channel-event-channel event)) key)))
+      (loop for (tick . event) in (stack-midi:track-to-absolute
+                                   (stack-midi:merge-tracks (stack-midi:smf-tracks smf)))
+            do (cond ((%note-p event)
+                      (let* ((key (stack-midi:note-on-event-key event))
+                             (note (list (frame tick) nil key
+                                         (stack-midi:note-on-event-velocity event)))
+                             (slot (voice event key)))
+                        (push note notes)
+                        (setf (svref open slot) (nconc (svref open slot) (list note)))))
+                     ((or (stack-midi:note-off-event-p event)
+                          (stack-midi:note-on-event-p event)) ; velocity 0
+                      (let* ((key (if (stack-midi:note-on-event-p event)
+                                      (stack-midi:note-on-event-key event)
+                                      (stack-midi:note-off-event-key event)))
+                             (note (pop (svref open (voice event key)))))
+                        ;; A note-off with no open note is ignored.
+                        (when note
+                          (setf (second note) (frame tick))))))))
+    (dolist (note notes)
+      (unless (second note)
+        (setf (second note) stop)))
+    (nreverse notes)))
 
 (defmethod render-midi :around ((engine audio-engine) smf
                                 &key (sample-rate 44100) soundfont (channels 2) (tail 1))
-  (declare (ignorable smf sample-rate soundfont channels tail))
-  (%au0-pending 'render-midi))
+  (let ((smf (%designated-smf smf)))
+    ;; Inline, so a STORE-VALUE sets the variable passed on below.
+    (check-type sample-rate (integer 1 #xFFFFFFFF))
+    (check-type soundfont (or null pathname string))
+    (check-type channels (member 1 2))
+    (check-type tail (real 0))
+    (%check-render-limit smf tail)
+    (let ((buffer (call-next-method engine smf :sample-rate sample-rate :soundfont soundfont
+                                               :channels channels :tail tail)))
+      (unless (%render-shape-p buffer smf sample-rate channels tail)
+        (error 'audio-engine-error
+               :engine engine
+               :reason (format nil "RENDER-MIDI returned ~S, not a buffer of ~D Hz, ~D ~
+                                    channel~:P and ~D frames"
+                               buffer sample-rate channels
+                               (render-frames smf sample-rate tail))))
+      buffer)))
 
 (defmethod render-stems :around ((engine audio-engine) smf
                                  &key (sample-rate 44100) soundfont (channels 2) (tail 1)
-                                   (by :track))
-  (declare (ignorable smf sample-rate soundfont channels tail by))
-  (%au0-pending 'render-stems))
+                                 (by :track))
+  (let ((smf (%designated-smf smf)))
+    ;; Inline, so a STORE-VALUE sets the variable passed on below.
+    (check-type sample-rate (integer 1 #xFFFFFFFF))
+    (check-type soundfont (or null pathname string))
+    (check-type channels (member 1 2))
+    (check-type tail (real 0))
+    (check-type by (member :track :channel))
+    (%check-render-limit smf tail)
+    (let ((stems (call-next-method engine smf :sample-rate sample-rate :soundfont soundfont
+                                              :channels channels :tail tail :by by)))
+      (unless (and (listp stems)
+                   (null (cdr (last stems)))
+                   (every (lambda (stem)
+                            (and (stem-p stem)
+                                 (%render-shape-p (stem-buffer stem) smf sample-rate
+                                                  channels tail)))
+                          stems))
+        (error 'audio-engine-error
+               :engine engine
+               :reason (format nil "RENDER-STEMS returned something other than a list of ~
+                                    stems of ~D Hz, ~D channel~:P and ~D frames"
+                               sample-rate channels (render-frames smf sample-rate tail))))
+      stems)))
 
 (defmethod render-midi ((engine audio-engine) smf &key sample-rate soundfont channels tail)
-  (declare (ignorable smf sample-rate soundfont channels tail))
-  (%au0-pending 'render-midi))
+  (declare (ignore smf sample-rate soundfont channels tail))
+  (error 'audio-backend-unavailable :engine engine :reason "no render-midi method"))
 
 (defmethod render-stems ((engine audio-engine) smf &key sample-rate soundfont channels tail by)
-  (declare (ignorable smf sample-rate soundfont channels tail by))
-  (%au0-pending 'render-stems))
+  (let ((tracks (stack-midi:smf-tracks smf)))
+    (flet ((stem-buffer-for (keep-p)
+             ;; Through the generic function, so its :AROUND checks each stem;
+             ;; the limit was asked about once, for the whole render.
+             (let ((*max-render-seconds* nil))
+               (render-midi engine (%filtered-smf smf keep-p)
+                            :sample-rate sample-rate :soundfont soundfont
+                            :channels channels :tail tail))))
+      (ecase by
+        (:track
+         (loop for track in tracks
+               for i from 0
+               when (some #'%note-p track)
+                 collect (let ((index i))
+                           (make-stem :name (%track-name track index)
+                                      :buffer (stem-buffer-for
+                                               (lambda (track-index event)
+                                                 (declare (ignore event))
+                                                 (= track-index index)))
+                                      :track index))))
+        (:channel
+         (loop for channel from 0 below 16
+               when (some (lambda (track)
+                            (some (lambda (event)
+                                    (and (%note-p event)
+                                         (= channel (stack-midi:channel-event-channel event))))
+                                  track))
+                          tracks)
+                 collect (let ((c channel))
+                           (make-stem :name (format nil "Channel ~D" (1+ c))
+                                      :buffer (stem-buffer-for
+                                               (lambda (track-index event)
+                                                 (declare (ignore track-index))
+                                                 (= c (stack-midi:channel-event-channel event))))
+                                      :channel c))))))))
 
 (defmethod render-midi ((engine reference-engine) smf &key sample-rate soundfont channels tail)
-  (declare (ignorable smf sample-rate soundfont channels tail))
-  (%au0-pending 'render-midi))
+  (declare (ignore soundfont))
+  (let* ((frames (render-frames smf sample-rate tail))
+         (acc (make-array frames :element-type 'double-float :initial-element 0d0))
+         (amplitude (float (reference-engine-amplitude engine) 1d0))
+         (square-p (eq :square (reference-engine-waveform engine)))
+         (two-pi (* 2 (coerce pi 'double-float))))
+    (loop for (n0 n1 key velocity) in (%reference-notes smf sample-rate)
+          do (let ((f (note-frequency key))
+                   (scale (* amplitude (/ velocity 127d0))))
+               (loop for n from n0 below (min n1 frames)
+                     ;; phi from the frame index, never a phase accumulator:
+                     ;; the square wave flips exactly where the formula says.
+                     do (let ((phi (/ (* f (- n n0)) sample-rate)))
+                          (incf (aref acc n)
+                                (* scale (if square-p
+                                             (if (< (- phi (floor phi)) 1/2) 1d0 -1d0)
+                                             (sin (* two-pi phi)))))))))
+    (let ((y (%sample-vector (* frames channels))))
+      (dotimes (n frames)
+        (let ((s (coerce (aref acc n) 'single-float)))
+          (dotimes (c channels)
+            (setf (aref y (+ (* n channels) c)) s))))
+      (%make-pcm-buffer sample-rate channels frames y))))

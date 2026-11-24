@@ -2,7 +2,7 @@
 
 Batch audio for cl-stack: PCM buffers, WAV read and write, mixing (gain, pan, mute and solo), resampling, and a protocol for engines that render Standard MIDI Files to audio, one buffer or one stem per track. There is no real-time audio I/O and no device access. MIDI files come from [midi-protocol](https://github.com/egao1980/midi-protocol); byte I/O builds on [binary-protocol](https://github.com/egao1980/binary-protocol).
 
-**Status:** contract for slice AU0 (0.1.0). The design is in the capability brief [cl-stack/docs/capabilities/audio.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/audio.md). Each file header in `src/` states its rules, the functions are stubs, and the Rove suite in `tests/` is the spec. A team-solve run implements them.
+**Status:** slice AU0 (0.1.0), implemented against its contract. The design is in the capability brief [cl-stack/docs/capabilities/audio.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/audio.md). Each file header in `src/` states its rules, and the Rove suite in `tests/` is the spec.
 
 | File | What |
 |------|------|

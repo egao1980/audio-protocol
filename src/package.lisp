@@ -70,8 +70,3 @@ Functions here never modify a buffer they are given.")
    #:reference-engine #:reference-engine-waveform #:reference-engine-amplitude))
 
 (in-package #:audio-protocol)
-
-(defun %au0-pending (name)
-  "Contract stub for slice AU0. Every call is replaced by the implementation,
-then this function is deleted."
-  (error "audio-protocol AU0 pending: ~A" name))

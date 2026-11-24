@@ -42,8 +42,77 @@
 (defconstant +resample-cutoff+ 0.95d0
   "Cutoff of the resampling kernel, as a fraction of the lower Nyquist frequency.")
 
+(defconstant +resample-table-limit+ (expt 2 20)
+  "Most kernel values RESAMPLE keeps in its phase table (one row per distinct
+fraction of t_j). Past it, every output frame computes its own row with the
+same function, so the two paths give the same samples.")
+
+(defun %resample-kernel (d c l)
+  "h(D) = C sinc(C D) w(D / L), the file header's kernel, in DOUBLE-FLOAT."
+  (declare (type double-float d c l))
+  (let* ((pi-d (coerce pi 'double-float))
+         (u (* c d))
+         (sinc (if (zerop u) 1d0 (/ (sin (* pi-d u)) (* pi-d u))))
+         (v (/ d l))
+         (w (+ 0.42d0 (* 0.5d0 (cos (* pi-d v))) (* 0.08d0 (cos (* 2 pi-d v))))))
+    (* c sinc w)))
+
+(defun %resample-taps (frac c l)
+  "(m0 . taps): TAPS holds h(FRAC - m) for the integers m from
+ceiling(FRAC - L) to floor(FRAC + L), m0 the first; FRAC is an exact rational
+in [0, 1), and a tap with |FRAC - m| not below L is 0."
+  (let* ((m0 (ceiling (- frac l)))
+         (m1 (floor (+ frac l)))
+         (taps (make-array (max 0 (1+ (- m1 m0))) :element-type 'double-float
+                                                  :initial-element 0d0)))
+    (loop for m from m0 to m1
+          for i from 0
+          do (let ((d (float (- frac m) 1d0)))
+               (when (< (abs d) l)
+                 (setf (aref taps i) (%resample-kernel d c l)))))
+    (cons m0 taps)))
+
 (defun resample (buffer sample-rate)
   "BUFFER converted to SAMPLE-RATE with a Blackman-windowed sinc (see the file
 header). Same rate: a copy."
-  (declare (ignorable buffer sample-rate))
-  (%au0-pending 'resample))
+  (check-type buffer pcm-buffer)
+  (check-type sample-rate (integer 1 #xFFFFFFFF))
+  (let ((in-rate (pcm-buffer-sample-rate buffer))
+        (channels (pcm-buffer-channels buffer))
+        (frames (pcm-buffer-frames buffer))
+        (x (pcm-buffer-samples buffer)))
+    (if (= sample-rate in-rate)
+        (%make-pcm-buffer in-rate channels frames (copy-seq x))
+        (let* ((r (/ sample-rate in-rate))
+               ;; t_j = j / R = j q / p: (floor (* j q) p) is the integer part
+               ;; and the phase, and t_j - n = phase/p - m exactly.
+               (p (numerator r))
+               (q (denominator r))
+               (out-frames (seconds-to-frame (pcm-buffer-duration buffer) sample-rate))
+               (c (* +resample-cutoff+ (min 1 r)))
+               (l (/ +resample-zero-crossings+ c))
+               (table (when (<= (* p (+ 2 (* 2 (ceiling l)))) +resample-table-limit+)
+                        (make-array p :initial-element nil)))
+               (y (%sample-vector (* out-frames channels))))
+          (declare (type sample-vector x y))
+          (dotimes (j out-frames)
+            (multiple-value-bind (base phase) (floor (* j q) p)
+              (let ((row (or (and table (svref table phase))
+                             (let ((row (%resample-taps (/ phase p) c l)))
+                               (when table (setf (svref table phase) row))
+                               row))))
+                (destructuring-bind (m0 . taps) row
+                  (declare (type (simple-array double-float (*)) taps))
+                  ;; Taps i with input frame n = BASE + M0 + i in 0..FRAMES-1.
+                  (let* ((first-n (+ base m0))
+                         (lo (max 0 (- first-n)))
+                         (hi (min (length taps) (- frames first-n))))
+                    (dotimes (ch channels)
+                      (let ((sum 0d0))
+                        (declare (type double-float sum))
+                        (loop for i from lo below hi
+                              do (incf sum (* (aref x (+ (* (+ first-n i) channels) ch))
+                                              (aref taps i))))
+                        (setf (aref y (+ (* j channels) ch))
+                              (coerce sum 'single-float)))))))))
+          (%make-pcm-buffer sample-rate channels out-frames y)))))
