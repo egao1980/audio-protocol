@@ -91,40 +91,149 @@
 (defparameter +pad-policies+ '(:center :end :none)
   "The :PAD values of the framing functions. Data.")
 
+;;; Argument checks and the framing arithmetic, shared with levels.lisp ------------
+
+(defun %check-member (value list)
+  "TYPE-ERROR unless VALUE is one of LIST."
+  (unless (member value list)
+    (error 'type-error :datum value :expected-type `(member ,@list))))
+
+(defun %signal-samples (signal)
+  "The samples of SIGNAL, a vector of reals or a one-channel PCM-BUFFER, as a
+fresh DOUBLE-VECTOR. A buffer of more channels is an AUDIO-ERROR."
+  (if (pcm-buffer-p signal)
+      (let ((channels (pcm-buffer-channels signal)))
+        (unless (= channels 1)
+          (error 'audio-error
+                 :reason (format nil "a signal is one channel, not ~D (downmix it first)"
+                                 channels)))
+        (%real-input (pcm-buffer-samples signal)))
+      (%real-input signal)))
+
+(defun %frame-count (length size hop pad)
+  "The number of frames of LENGTH samples (the file header's formulas)."
+  (values
+   (ecase pad
+     (:center (ceiling length hop))
+     (:end (if (zerop length) 0 (1+ (ceiling (max 0 (- length size)) hop))))
+     (:none (if (< length size) 0 (1+ (floor (- length size) hop)))))))
+
+(defun %frame-start (index size hop pad)
+  "s_INDEX: the sample at which frame INDEX starts."
+  (if (eq pad :center)
+      (- (* index hop) (floor size 2))
+      (* index hop)))
+
+(defun %window-value (kind m d)
+  "Point M of the window KIND with denominator D, u = 2 pi M / D."
+  (let ((u (/ (* 2d0 (float pi 1d0) (float m 1d0)) (float d 1d0))))
+    (ecase kind
+      (:hann (- 0.5d0 (* 0.5d0 (cos u))))
+      (:hamming (- 0.54d0 (* 0.46d0 (cos u))))
+      (:blackman (+ (- 0.42d0 (* 0.5d0 (cos u))) (* 0.08d0 (cos (* 2 u))))))))
+
+(defun %frame-size (size)
+  "SIZE as STFT's frame size, a positive integer, else TYPE-ERROR."
+  (check-type size (integer 1))
+  size)
+
+;;; Windows, frames, STFT ------------------------------------------------------------
+
 (defun make-window (kind size &key symmetric)
   "A fresh DOUBLE-VECTOR: the window KIND of SIZE points, periodic unless
 SYMMETRIC. See frames.lisp."
-  (declare (ignorable kind size symmetric))
-  (%au3-pending 'make-window))
+  (%check-member kind +window-kinds+)
+  (check-type size (integer 0))
+  (let ((w (make-array size :element-type 'double-float :initial-element 1d0)))
+    (when (and (> size 1) (not (eq kind :rectangular)))
+      (let ((d (if symmetric (1- size) size)))
+        ;; Point n reads the angle of min(n, D - n), so w(n) = w(D - n) holds
+        ;; exactly, and u stays in 0 .. pi.
+        (dotimes (n size)
+          (setf (aref w n) (%window-value kind (min n (- d n)) d)))))
+    w))
 
 (defun frame-count (length size hop &key (pad :center))
   "How many frames FRAME-SIGNAL makes of LENGTH samples. See frames.lisp."
-  (declare (ignorable length size hop pad))
-  (%au3-pending 'frame-count))
+  (check-type length (integer 0))
+  (check-type size (integer 1))
+  (check-type hop (integer 1))
+  (%check-member pad +pad-policies+)
+  (%frame-count length size hop pad))
 
 (defun frame-start (index size hop &key (pad :center))
   "The sample at which frame INDEX starts (negative before the signal)."
-  (declare (ignorable index size hop pad))
-  (%au3-pending 'frame-start))
+  (check-type index (integer 0))
+  (check-type size (integer 1))
+  (check-type hop (integer 1))
+  (%check-member pad +pad-policies+)
+  (%frame-start index size hop pad))
 
 (defun frame-signal (signal size hop &key (pad :center))
   "A fresh SIMPLE-VECTOR of DOUBLE-VECTOR frames of SIGNAL, SIZE samples each,
 HOP apart. See frames.lisp."
-  (declare (ignorable signal size hop pad))
-  (%au3-pending 'frame-signal))
+  (check-type signal (or vector pcm-buffer))
+  (check-type size (integer 1))
+  (check-type hop (integer 1))
+  (%check-member pad +pad-policies+)
+  (let* ((x (%signal-samples signal))
+         (length (length x))
+         (count (%frame-count length size hop pad))
+         (frames (make-array count)))
+    (declare (type double-vector x))
+    (dotimes (i count frames)
+      (let ((frame (%dvec size))
+            (start (%frame-start i size hop pad)))
+        (loop for j from (max 0 (- start)) below (min size (- length start))
+              do (setf (aref frame j) (aref x (+ start j))))
+        (setf (aref frames i) frame)))))
 
 (defun stft (signal size hop &key (window :hann) (pad :center))
   "A fresh SIMPLE-VECTOR of half spectra, the RFFT of each windowed frame of
 SIGNAL. See frames.lisp."
-  (declare (ignorable signal size hop window pad))
-  (%au3-pending 'stft))
+  ;; The argument types, then SIZE once (the restarts), then the values that
+  ;; depend on the final SIZE, then the frames.
+  (check-type signal (or vector pcm-buffer))
+  (check-type size (integer 1))
+  (check-type hop (integer 1))
+  (%check-member pad +pad-policies+)
+  (unless (or (null window) (vectorp window) (member window +window-kinds+))
+    (error 'type-error :datum window
+                       :expected-type `(or null vector (member ,@+window-kinds+))))
+  (let ((given (and (vectorp window) (%real-input window)))
+        (x (%signal-samples signal)))
+    (declare (type double-vector x))
+    (multiple-value-bind (frame-size points)
+        (%settle-size size #'%frame-size #'identity "stft frame size")
+      (when (and given (/= (length given) frame-size))
+        (error 'audio-error
+               :reason (format nil "a window of ~D points for frames of ~D"
+                               (length given) frame-size)))
+      (let* ((w (or given (make-window (or window :rectangular) frame-size)))
+             (length (length x))
+             (count (%frame-count length frame-size hop pad))
+             (spectra (make-array count)))
+        (declare (type double-vector w))
+        (multiple-value-bind (cs sn) (%twiddles points -1)
+          (dotimes (i count spectra)
+            (let ((re (%dvec points))
+                  (start (%frame-start i frame-size hop pad)))
+              (declare (type double-vector re))
+              (loop for j from (max 0 (- start)) below (min frame-size (- length start))
+                    do (setf (aref re j) (* (aref x (+ start j)) (aref w j))))
+              (setf (aref spectra i) (%half-spectrum re cs sn)))))))))
 
 (defun magnitude (spectrum)
   "A fresh DOUBLE-VECTOR of the absolute values of SPECTRUM."
-  (declare (ignorable spectrum))
-  (%au3-pending 'magnitude))
+  (let* ((v (%complex-input spectrum))
+         (out (%dvec (length v))))
+    (declare (type complex-vector v))
+    (dotimes (k (length v) out)
+      (setf (aref out k) (abs (aref v k))))))
 
 (defun bin-frequency (k size sample-rate)
   "K * SAMPLE-RATE / SIZE, exactly: the frequency of bin K."
-  (declare (ignorable k size sample-rate))
-  (%au3-pending 'bin-frequency))
+  (check-type k (integer 0))
+  (check-type size (integer 1))
+  (check-type sample-rate (integer 1))
+  (/ (* k sample-rate) size))

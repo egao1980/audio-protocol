@@ -37,30 +37,92 @@
 
 (in-package #:audio-protocol/dsp)
 
+(defun %level-samples (x)
+  "Every sample of X, a PCM-BUFFER of any channel count or a vector of reals,
+as a fresh DOUBLE-VECTOR."
+  (%real-input (if (pcm-buffer-p x) (pcm-buffer-samples x) x)))
+
+(defun %peak (v)
+  "max |v_m| of the DOUBLE-VECTOR V, from 0d0."
+  (declare (type double-vector v))
+  (let ((p 0d0))
+    (declare (type double-float p))
+    (dotimes (i (length v) p)
+      (setf p (max p (abs (aref v i)))))))
+
 (defun rms (x)
   "The root mean square of every sample of X (a PCM-BUFFER or a vector of
 reals), a DOUBLE-FLOAT; 0d0 for no samples."
-  (declare (ignorable x))
-  (%au3-pending 'rms))
+  (check-type x (or vector pcm-buffer))
+  (let* ((v (%level-samples x))
+         (m (length v))
+         (sum 0d0))
+    (declare (type double-vector v) (type double-float sum))
+    (dotimes (i m)
+      (incf sum (* (aref v i) (aref v i))))
+    (if (zerop m) 0d0 (sqrt (/ sum m)))))
 
 (defun peak (x)
   "The largest |sample| of X (a PCM-BUFFER or a vector of reals), a
 DOUBLE-FLOAT; 0d0 for no samples."
-  (declare (ignorable x))
-  (%au3-pending 'peak))
+  (check-type x (or vector pcm-buffer))
+  (%peak (%level-samples x)))
 
 (defun frame-rms (signal size hop &key (pad :center))
   "A fresh DOUBLE-VECTOR: the RMS of each frame of SIGNAL (see FRAME-SIGNAL)."
-  (declare (ignorable signal size hop pad))
-  (%au3-pending 'frame-rms))
+  (check-type signal (or vector pcm-buffer))
+  (check-type size (integer 1))
+  (check-type hop (integer 1))
+  (%check-member pad +pad-policies+)
+  (let* ((x (%signal-samples signal))
+         (length (length x))
+         (count (%frame-count length size hop pad))
+         (out (%dvec count)))
+    (declare (type double-vector x))
+    ;; Each frame is summed on its own, over its samples inside the signal (the
+    ;; padding adds zeros), so a silent frame is exactly 0 whatever came before.
+    (dotimes (i count out)
+      (let ((start (%frame-start i size hop pad))
+            (sum 0d0))
+        (declare (type double-float sum))
+        (loop for j from (max 0 (- start)) below (min size (- length start))
+              do (let ((v (aref x (+ start j))))
+                   (incf sum (* v v))))
+        (setf (aref out i) (sqrt (/ sum size)))))))
 
 (defun normalize (x &key (peak-db 0))
   "X scaled so that its peak is PEAK-DB dBFS: a fresh PCM-BUFFER for a buffer,
 a fresh DOUBLE-VECTOR for a vector. Silence is copied unscaled."
-  (declare (ignorable x peak-db))
-  (%au3-pending 'normalize))
+  (check-type x (or vector pcm-buffer))
+  (check-type peak-db real)
+  (let* ((v (%level-samples x))
+         (p (%peak v)))
+    (declare (type double-vector v))
+    (unless (zerop p)
+      (let ((g (/ (db-to-gain peak-db) p)))
+        (dotimes (i (length v))
+          (setf (aref v i) (* g (aref v i))))))
+    (if (pcm-buffer-p x)
+        ;; MAKE-PCM-BUFFER copies, rounding each sample once to a SINGLE-FLOAT.
+        (make-pcm-buffer :sample-rate (pcm-buffer-sample-rate x)
+                         :channels (pcm-buffer-channels x)
+                         :samples v)
+        v)))
 
 (defun downmix (buffer)
   "A fresh mono PCM-BUFFER: the mean of BUFFER's channels, frame by frame."
-  (declare (ignorable buffer))
-  (%au3-pending 'downmix))
+  (check-type buffer pcm-buffer)
+  (let* ((channels (pcm-buffer-channels buffer))
+         (frames (pcm-buffer-frames buffer))
+         (x (pcm-buffer-samples buffer))
+         (out (%dvec frames)))
+    (dotimes (n frames)
+      (let ((sum 0d0)
+            (base (* n channels)))
+        (declare (type double-float sum))
+        (dotimes (k channels)
+          (incf sum (float (aref x (+ base k)) 1d0)))
+        (setf (aref out n) (/ sum channels))))
+    (make-pcm-buffer :sample-rate (pcm-buffer-sample-rate buffer)
+                     :channels 1
+                     :samples out)))
