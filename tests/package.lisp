@@ -1,5 +1,8 @@
 (defpackage #:audio-protocol/tests
-  (:use #:cl #:rove #:audio-protocol))
+  (:use #:cl #:rove #:audio-protocol)
+  ;; The AU3 tests call the DSP package as a consumer would, through a local
+  ;; nickname: its RMS, PEAK, ... don't meet this package's own helpers.
+  (:local-nicknames (#:dsp #:audio-protocol/dsp)))
 
 (in-package #:audio-protocol/tests)
 
